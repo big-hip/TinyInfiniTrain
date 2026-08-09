@@ -4,6 +4,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <iomanip>
 #include <memory>
 #include <numeric>
 #include <unordered_map>
@@ -277,13 +278,32 @@ std::shared_ptr<Tensor> Tensor::Contiguous() {
 }
 
 std::shared_ptr<Tensor> Tensor::Flatten(int64_t start, int64_t end) {
-    // return Contiguous()->View(new_shape);
-    // =================================== 作业 ===================================
-    // TODO：实现张量扁平化操作，将指定维度范围[start, end]内的所有维度合并为一个维度
-    // HINT:
-    // =================================== 作业 ===================================
+    if (dims_.empty()) {
+        CHECK(start == 0 || start == -1);
+        CHECK(end == 0 || end == -1);
+        return Contiguous()->View({1});
+    }
 
-    return std::make_shared<Tensor>();
+    const int64_t ndim = static_cast<int64_t>(dims_.size());
+    if (start < 0) {
+        start += ndim;
+    }
+    if (end < 0) {
+        end += ndim;
+    }
+    CHECK_GE(start, 0);
+    CHECK_LT(start, ndim);
+    CHECK_GE(end, 0);
+    CHECK_LT(end, ndim);
+    CHECK_LE(start, end);
+
+    std::vector<int64_t> new_shape;
+    new_shape.insert(new_shape.end(), dims_.begin(), dims_.begin() + start);
+    const int64_t flattened_size
+        = std::accumulate(dims_.begin() + start, dims_.begin() + end + 1, int64_t{1}, std::multiplies<int64_t>{});
+    new_shape.push_back(flattened_size);
+    new_shape.insert(new_shape.end(), dims_.begin() + end + 1, dims_.end());
+    return Contiguous()->View(new_shape);
 }
 
 std::shared_ptr<Tensor> Tensor::Squeeze(int64_t dim) {
@@ -354,10 +374,32 @@ std::shared_ptr<Tensor> Tensor::RequiresGrad() {
 }
 
 void Tensor::Backward(std::shared_ptr<Tensor> gradient, bool retain_graph, bool create_graph) const {
-    // =================================== 作业 ===================================
-    // TODO：实现自动微分反向传播
-    // 功能描述：1. 计算当前张量对叶子节点的梯度    2. 支持多输出场景的梯度累加
-    // =================================== 作业 ===================================
+    if (!requires_grad_) {
+        return;
+    }
+
+    if (!gradient) {
+        CHECK_EQ(NumElements(), 1);
+        gradient = std::make_shared<Tensor>(Dims(), Dtype(), GetDevice());
+        gradient->Fill<float>(1.0f);
+    }
+
+    CHECK(gradient->GetDevice() == GetDevice());
+    CHECK_EQ(static_cast<int>(gradient->Dtype()), static_cast<int>(Dtype()));
+    CHECK(gradient->Dims() == Dims());
+
+    if (!grad_fn_) {
+        if (!grad_) {
+            auto *self = const_cast<Tensor *>(this);
+            self->grad_ = std::make_shared<Tensor>(Dims(), Dtype(), GetDevice());
+            self->grad_->Fill<float>(0.0f);
+        }
+        auto kernel = Dispatcher::Instance().GetKernel({GetDevice().Type(), "AccumulateGrad"});
+        kernel.Call<void>(gradient, 1.0f, grad_);
+        return;
+    }
+
+    grad_fn_->BackwardPartial(gradient, output_idx_);
 }
 
 void Tensor::ZeroGrad() {
