@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -53,22 +54,55 @@ template <typename T> T BytesToType(const std::vector<uint8_t> &bytes, size_t of
 }
 
 TinyShakespeareFile ReadTinyShakespeareFile(const std::string &path, size_t sequence_length) {
-    /* =================================== 作业 ===================================
-       TODO：实现二进制数据集文件解析
-       文件格式说明：
-    ----------------------------------------------------------------------------------
-    | HEADER (1024 bytes)                     | DATA (tokens)                        |
-    | magic(4B) | version(4B) | num_toks(4B) | reserved(1012B) | token数据           |
-    ----------------------------------------------------------------------------------
-       =================================== 作业 =================================== */
+    CHECK_GT(sequence_length, 0);
+    CHECK(std::filesystem::exists(path)) << "Dataset file not found: " << path;
+
+    std::ifstream ifs(path, std::ios::binary);
+    CHECK(ifs.is_open()) << "Failed to open dataset file: " << path;
+    const auto header = ReadSeveralBytesFromIfstream(1024, &ifs);
+    CHECK_EQ(ifs.gcount(), 1024) << "Dataset header is truncated: " << path;
+
+    const uint32_t magic = BytesToType<uint32_t>(header, 0);
+    CHECK(kTypeMap.contains(static_cast<int>(magic))) << "Unsupported dataset magic: " << magic;
+    const auto type = kTypeMap.at(static_cast<int>(magic));
+    const uint32_t version = BytesToType<uint32_t>(header, 4);
+    const uint32_t expected_version = type == TinyShakespeareType::kUINT16 ? 1 : 7;
+    CHECK_EQ(version, expected_version) << "Unsupported dataset version: " << version;
+    const uint32_t num_tokens = BytesToType<uint32_t>(header, 8);
+    CHECK_GE(num_tokens, sequence_length + 1);
+
+    const size_t token_size = kTypeToSize.at(type);
+    const auto file_size = std::filesystem::file_size(path);
+    const size_t data_size = static_cast<size_t>(num_tokens) * token_size;
+    CHECK_GE(file_size, 1024 + data_size) << "Dataset token data is truncated: " << path;
+
+    std::vector<uint8_t> raw_data(data_size);
+    ifs.read(reinterpret_cast<char *>(raw_data.data()), static_cast<std::streamsize>(raw_data.size()));
+    CHECK_EQ(ifs.gcount(), static_cast<std::streamsize>(raw_data.size())) << "Dataset token data is truncated: " << path;
+
+    infini_train::Tensor tensor({static_cast<int64_t>(num_tokens)}, DataType::kINT64);
+    auto *tensor_ptr = static_cast<int64_t *>(tensor.DataPtr());
+    if (type == TinyShakespeareType::kUINT16) {
+        for (uint32_t idx = 0; idx < num_tokens; ++idx) {
+            tensor_ptr[idx] = BytesToType<uint16_t>(raw_data, static_cast<size_t>(idx) * token_size);
+        }
+    } else {
+        for (uint32_t idx = 0; idx < num_tokens; ++idx) {
+            tensor_ptr[idx] = BytesToType<uint32_t>(raw_data, static_cast<size_t>(idx) * token_size);
+        }
+    }
+
+    const int64_t num_chunks =
+        (static_cast<int64_t>(num_tokens) + static_cast<int64_t>(sequence_length) - 1) / sequence_length;
+    return {type, {num_chunks, static_cast<int64_t>(sequence_length)}, std::move(tensor)};
 }
 } // namespace
 
-TinyShakespeareDataset::TinyShakespeareDataset(const std::string &filepath, size_t sequence_length) {
-    // =================================== 作业 ===================================
-    // TODO：初始化数据集实例
-    // HINT: 调用ReadTinyShakespeareFile加载数据文件
-    // =================================== 作业 ===================================
+TinyShakespeareDataset::TinyShakespeareDataset(const std::string &filepath, size_t sequence_length)
+    : text_file_(ReadTinyShakespeareFile(filepath, sequence_length)), sequence_length_(sequence_length),
+      sequence_size_in_bytes_(sequence_length * sizeof(int64_t)), num_samples_(text_file_.dims[0] - 1) {
+    CHECK_GE(text_file_.dims.size(), 2);
+    CHECK_GT(text_file_.dims[0], 0);
 }
 
 std::pair<std::shared_ptr<infini_train::Tensor>, std::shared_ptr<infini_train::Tensor>>
