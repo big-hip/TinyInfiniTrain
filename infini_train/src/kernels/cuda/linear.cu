@@ -23,26 +23,141 @@ namespace infini_train::kernels::cuda {
         }                                                                                                              \
     } while (0)
 
-std::shared_ptr<Tensor> MatmulForward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tensor> &other) {
-    // =================================== 作业 ===================================
-    // TODO：实现CUDA上的矩阵乘法前向计算
-    // REF:
-    // =================================== 作业 ===================================
+namespace {
+void CheckMatmulInputs(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tensor> &other) {
+    CHECK(input->GetDevice().IsCUDA());
+    CHECK(other->GetDevice().IsCUDA());
+    CHECK(input->GetDevice() == other->GetDevice());
+    CHECK(input->Dtype() == DataType::kFLOAT32);
+    CHECK(other->Dtype() == DataType::kFLOAT32);
+    CHECK_EQ(input->Dims().size(), other->Dims().size());
+    CHECK_GE(input->Dims().size(), 2);
+    for (size_t i = 0; i + 2 < input->Dims().size(); ++i) {
+        CHECK_EQ(input->Dims()[i], other->Dims()[i]);
+    }
+    CHECK_EQ(input->Dims().back(), other->Dims()[other->Dims().size() - 2]);
+}
 
-    auto output = std::make_shared<Tensor>();
+int64_t BatchCount(const std::vector<int64_t> &dims) {
+    return std::accumulate(dims.begin(), dims.end() - 2, int64_t{1}, std::multiplies<int64_t>{});
+}
+} // namespace
+
+__global__ void MatmulForwardKernel(const float *input, const float *other, float *output, int64_t batch_count,
+                                    int64_t rows, int64_t inner, int64_t cols) {
+    const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t total = batch_count * rows * cols;
+    if (index >= total) {
+        return;
+    }
+
+    const int64_t col = index % cols;
+    const int64_t row = (index / cols) % rows;
+    const int64_t batch = index / (rows * cols);
+    const float *input_batch = input + batch * rows * inner;
+    const float *other_batch = other + batch * inner * cols;
+    float value = 0.0f;
+    for (int64_t k = 0; k < inner; ++k) {
+        value += input_batch[row * inner + k] * other_batch[k * cols + col];
+    }
+    output[index] = value;
+}
+
+__global__ void MatmulGradInputKernel(const float *other, const float *grad_output, float *grad_input,
+                                      int64_t batch_count, int64_t rows, int64_t inner, int64_t cols) {
+    const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t total = batch_count * rows * inner;
+    if (index >= total) {
+        return;
+    }
+
+    const int64_t k = index % inner;
+    const int64_t row = (index / inner) % rows;
+    const int64_t batch = index / (rows * inner);
+    const float *other_batch = other + batch * inner * cols;
+    const float *grad_output_batch = grad_output + batch * rows * cols;
+    float value = 0.0f;
+    for (int64_t col = 0; col < cols; ++col) {
+        value += grad_output_batch[row * cols + col] * other_batch[k * cols + col];
+    }
+    grad_input[index] = value;
+}
+
+__global__ void MatmulGradOtherKernel(const float *input, const float *grad_output, float *grad_other,
+                                      int64_t batch_count, int64_t rows, int64_t inner, int64_t cols) {
+    const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t total = batch_count * inner * cols;
+    if (index >= total) {
+        return;
+    }
+
+    const int64_t col = index % cols;
+    const int64_t k = (index / cols) % inner;
+    const int64_t batch = index / (inner * cols);
+    const float *input_batch = input + batch * rows * inner;
+    const float *grad_output_batch = grad_output + batch * rows * cols;
+    float value = 0.0f;
+    for (int64_t row = 0; row < rows; ++row) {
+        value += input_batch[row * inner + k] * grad_output_batch[row * cols + col];
+    }
+    grad_other[index] = value;
+}
+
+std::shared_ptr<Tensor> MatmulForward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tensor> &other) {
+    CheckMatmulInputs(input, other);
+    const auto &input_dims = input->Dims();
+    const auto &other_dims = other->Dims();
+    const int64_t batch_count = BatchCount(input_dims);
+    const int64_t rows = input_dims[input_dims.size() - 2];
+    const int64_t inner = input_dims.back();
+    const int64_t cols = other_dims.back();
+    auto output_dims = input_dims;
+    output_dims.back() = cols;
+    auto output = std::make_shared<Tensor>(output_dims, DataType::kFLOAT32, input->GetDevice());
+
+    const int threads_per_block = 256;
+    const int64_t total = batch_count * rows * cols;
+    const int num_blocks = (total + threads_per_block - 1) / threads_per_block;
+    MatmulForwardKernel<<<num_blocks, threads_per_block>>>(static_cast<const float *>(input->DataPtr()),
+                                                           static_cast<const float *>(other->DataPtr()),
+                                                           static_cast<float *>(output->DataPtr()), batch_count, rows,
+                                                           inner, cols);
+    CUDA_CHECK(cudaGetLastError());
     return output;
 }
 
 std::tuple<std::shared_ptr<Tensor>, std::shared_ptr<Tensor>>
 MatmulBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tensor> &other,
                const std::shared_ptr<Tensor> &grad_output) {
-    // =================================== 作业 ===================================
-    // TODO：实现CUDA上的矩阵乘法反向传播
-    // REF:
-    // =================================== 作业 ===================================
+    CheckMatmulInputs(input, other);
+    const auto &input_dims = input->Dims();
+    const auto &other_dims = other->Dims();
+    auto output_dims = input_dims;
+    output_dims.back() = other_dims.back();
+    CHECK(grad_output->GetDevice().IsCUDA());
+    CHECK(grad_output->Dtype() == DataType::kFLOAT32);
+    CHECK(grad_output->Dims() == output_dims);
 
-    auto grad_input = std::make_shared<Tensor>();
-    auto grad_other = std::make_shared<Tensor>();
+    const int64_t batch_count = BatchCount(input_dims);
+    const int64_t rows = input_dims[input_dims.size() - 2];
+    const int64_t inner = input_dims.back();
+    const int64_t cols = other_dims.back();
+    auto grad_input = std::make_shared<Tensor>(input_dims, DataType::kFLOAT32, input->GetDevice());
+    auto grad_other = std::make_shared<Tensor>(other_dims, DataType::kFLOAT32, other->GetDevice());
+    const int threads_per_block = 256;
+
+    const int64_t input_elements = batch_count * rows * inner;
+    const int input_blocks = (input_elements + threads_per_block - 1) / threads_per_block;
+    MatmulGradInputKernel<<<input_blocks, threads_per_block>>>(
+        static_cast<const float *>(other->DataPtr()), static_cast<const float *>(grad_output->DataPtr()),
+        static_cast<float *>(grad_input->DataPtr()), batch_count, rows, inner, cols);
+
+    const int64_t other_elements = batch_count * inner * cols;
+    const int other_blocks = (other_elements + threads_per_block - 1) / threads_per_block;
+    MatmulGradOtherKernel<<<other_blocks, threads_per_block>>>(
+        static_cast<const float *>(input->DataPtr()), static_cast<const float *>(grad_output->DataPtr()),
+        static_cast<float *>(grad_other->DataPtr()), batch_count, rows, inner, cols);
+    CUDA_CHECK(cudaGetLastError());
     return {grad_input, grad_other};
 }
 

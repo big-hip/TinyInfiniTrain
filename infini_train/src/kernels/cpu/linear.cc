@@ -10,26 +10,110 @@
 #include "infini_train/include/tensor.h"
 
 namespace infini_train::kernels::cpu {
-std::shared_ptr<Tensor> MatmulForward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tensor> &other) {
-    // =================================== 作业 ===================================
-    // TODO：实现CPU上的矩阵乘法前向计算
-    // REF:
-    // =================================== 作业 ===================================
+namespace {
+void CheckMatmulInputs(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tensor> &other) {
+    CHECK(input->GetDevice().IsCPU());
+    CHECK(other->GetDevice().IsCPU());
+    CHECK(input->GetDevice() == other->GetDevice());
+    CHECK(input->Dtype() == DataType::kFLOAT32);
+    CHECK(other->Dtype() == DataType::kFLOAT32);
+    CHECK_EQ(input->Dims().size(), other->Dims().size());
+    CHECK_GE(input->Dims().size(), 2);
+    for (size_t i = 0; i + 2 < input->Dims().size(); ++i) {
+        CHECK_EQ(input->Dims()[i], other->Dims()[i]);
+    }
+    CHECK_EQ(input->Dims().back(), other->Dims()[other->Dims().size() - 2]);
+}
 
-    auto output = std::make_shared<Tensor>();
-    return {output};
+int64_t BatchCount(const std::vector<int64_t> &dims) {
+    return std::accumulate(dims.begin(), dims.end() - 2, int64_t{1}, std::multiplies<int64_t>{});
+}
+} // namespace
+
+std::shared_ptr<Tensor> MatmulForward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tensor> &other) {
+    CheckMatmulInputs(input, other);
+
+    const auto &input_dims = input->Dims();
+    const auto &other_dims = other->Dims();
+    const int64_t batch_count = BatchCount(input_dims);
+    const int64_t rows = input_dims[input_dims.size() - 2];
+    const int64_t inner = input_dims.back();
+    const int64_t cols = other_dims.back();
+
+    auto output_dims = input_dims;
+    output_dims.back() = cols;
+    auto output = std::make_shared<Tensor>(output_dims, DataType::kFLOAT32, input->GetDevice());
+
+    const auto *input_ptr = static_cast<const float *>(input->DataPtr());
+    const auto *other_ptr = static_cast<const float *>(other->DataPtr());
+    auto *output_ptr = static_cast<float *>(output->DataPtr());
+    for (int64_t batch = 0; batch < batch_count; ++batch) {
+        const auto *input_batch = input_ptr + batch * rows * inner;
+        const auto *other_batch = other_ptr + batch * inner * cols;
+        auto *output_batch = output_ptr + batch * rows * cols;
+        for (int64_t row = 0; row < rows; ++row) {
+            for (int64_t col = 0; col < cols; ++col) {
+                float value = 0.0f;
+                for (int64_t k = 0; k < inner; ++k) {
+                    value += input_batch[row * inner + k] * other_batch[k * cols + col];
+                }
+                output_batch[row * cols + col] = value;
+            }
+        }
+    }
+    return output;
 }
 
 std::tuple<std::shared_ptr<Tensor>, std::shared_ptr<Tensor>>
 MatmulBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tensor> &other,
                const std::shared_ptr<Tensor> &grad_output) {
-    // =================================== 作业 ===================================
-    // TODO：实现CPU上的矩阵乘法反向传播
-    // REF:
-    // =================================== 作业 ===================================
+    CheckMatmulInputs(input, other);
 
-    auto grad_input = std::make_shared<Tensor>();
-    auto grad_other = std::make_shared<Tensor>();
+    const auto &input_dims = input->Dims();
+    const auto &other_dims = other->Dims();
+    auto output_dims = input_dims;
+    output_dims.back() = other_dims.back();
+    CHECK(grad_output->GetDevice().IsCPU());
+    CHECK(grad_output->Dtype() == DataType::kFLOAT32);
+    CHECK(grad_output->Dims() == output_dims);
+
+    const int64_t batch_count = BatchCount(input_dims);
+    const int64_t rows = input_dims[input_dims.size() - 2];
+    const int64_t inner = input_dims.back();
+    const int64_t cols = other_dims.back();
+    auto grad_input = std::make_shared<Tensor>(input_dims, DataType::kFLOAT32, input->GetDevice());
+    auto grad_other = std::make_shared<Tensor>(other_dims, DataType::kFLOAT32, other->GetDevice());
+
+    const auto *input_ptr = static_cast<const float *>(input->DataPtr());
+    const auto *other_ptr = static_cast<const float *>(other->DataPtr());
+    const auto *grad_output_ptr = static_cast<const float *>(grad_output->DataPtr());
+    auto *grad_input_ptr = static_cast<float *>(grad_input->DataPtr());
+    auto *grad_other_ptr = static_cast<float *>(grad_other->DataPtr());
+    for (int64_t batch = 0; batch < batch_count; ++batch) {
+        const auto *input_batch = input_ptr + batch * rows * inner;
+        const auto *other_batch = other_ptr + batch * inner * cols;
+        const auto *grad_output_batch = grad_output_ptr + batch * rows * cols;
+        auto *grad_input_batch = grad_input_ptr + batch * rows * inner;
+        auto *grad_other_batch = grad_other_ptr + batch * inner * cols;
+        for (int64_t row = 0; row < rows; ++row) {
+            for (int64_t k = 0; k < inner; ++k) {
+                float value = 0.0f;
+                for (int64_t col = 0; col < cols; ++col) {
+                    value += grad_output_batch[row * cols + col] * other_batch[k * cols + col];
+                }
+                grad_input_batch[row * inner + k] = value;
+            }
+        }
+        for (int64_t k = 0; k < inner; ++k) {
+            for (int64_t col = 0; col < cols; ++col) {
+                float value = 0.0f;
+                for (int64_t row = 0; row < rows; ++row) {
+                    value += input_batch[row * inner + k] * grad_output_batch[row * cols + col];
+                }
+                grad_other_batch[k * cols + col] = value;
+            }
+        }
+    }
     return {grad_input, grad_other};
 }
 
